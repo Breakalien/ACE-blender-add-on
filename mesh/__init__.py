@@ -820,6 +820,15 @@ def _build_object_from_lod(
     extra_attr = mesh.attributes.new(_EXTRA_ATTR, "FLOAT_COLOR", "POINT")
     for i, ex in enumerate(lod.extra):
         extra_attr.data[i].color = ex if len(ex) == 4 else (0.0, 0.0, 0.0, 0.0)
+    # Without this, Blender never renders ac_extra in the viewport (Solid
+    # shading's "Attribute"/"Vertex" colour mode, and the default colour
+    # attribute node in Material Preview/Rendered, both only ever show the
+    # mesh's *active* colour attribute) - the paint data itself would still
+    # be perfectly correct and still round-trip into the .mesh file either
+    # way, it just wouldn't be visible.
+    idx = mesh.color_attributes.find(_EXTRA_ATTR)
+    if idx != -1:
+        mesh.color_attributes.active_color_index = idx
 
     mesh.update()
     return bpy.data.objects.new(name, mesh)
@@ -1802,7 +1811,8 @@ class MESH_OT_ac_paint_position(Operator):
         r, g, b = _POSITION_COLORS[self.position]
         count, touched = 0, 0
         for obj in objects:
-            bm = bmesh.from_edit_mesh(obj.data)
+            mesh = obj.data
+            bm = bmesh.from_edit_mesh(mesh)
             layer = _get_or_create_extra_bm_layer(bm)
             n = 0
             for v in bm.verts:
@@ -1810,9 +1820,18 @@ class MESH_OT_ac_paint_position(Operator):
                     v[layer] = (r, g, b, 1.0)
                     n += 1
             if n:
-                bmesh.update_edit_mesh(obj.data)
+                bmesh.update_edit_mesh(mesh)
                 touched += 1
-            count += n
+                count += n
+            # ac_extra can exist on a mesh (e.g. one produced by Prepare /
+            # Is plastic-glass-chrome, which round-trips attributes through
+            # bmesh) without ever having been the *active* colour attribute -
+            # Blender only ever renders that one in the viewport, so the
+            # paint above would otherwise apply correctly and still be
+            # invisible. Cheap enough to just re-set on every paint.
+            idx = mesh.color_attributes.find(_EXTRA_ATTR)
+            if idx != -1:
+                mesh.color_attributes.active_color_index = idx
         if count == 0:
             self.report({"WARNING"}, "No vertices selected.")
             return {"CANCELLED"}
@@ -1905,6 +1924,9 @@ class MESH_OT_ac_erase_all_vcolor(Operator):
                     item.color = (0.0, 0.0, 0.0, 1.0)
                     verts_done += 1
                 mesh.update()
+            idx = mesh.color_attributes.find(_EXTRA_ATTR)
+            if idx != -1:
+                mesh.color_attributes.active_color_index = idx
             objects_done += 1
 
         self.report({"INFO"}, f"Vertex colours reset to black: {objects_done} mesh(es), {verts_done} vertex(es).")
