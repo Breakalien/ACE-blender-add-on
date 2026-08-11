@@ -5,10 +5,13 @@ A Blender add-on for importing and exporting Assetto Corsa EVO car meshes
 and painting the car's data-driven light system (function masks, vertex-color
 positions, and the "FIXED" light materials the game expects).
 
+Tutorials will comes step by step here: [Youtube channel](https://www.youtube.com/@ALIEN_ONE-mods)
+Updates will be here: [Patreon](https://www.patreon.com/cw/alien_one)
+everything is free, no membership needed.
+
 ## Installation
 
-1. Zip the `mesh/` folder from this repository (or download a release zip if
-   one is provided).
+1. Zip the `mesh/` folder from this repository (or download a release zip).
 2. In Blender: **Edit > Preferences > Add-ons > Install...**, select the zip,
    then enable **AC Mesh**.
 3. The add-on adds an **AC Mesh** tab to the 3D Viewport sidebar (press `N`
@@ -19,7 +22,7 @@ positions, and the "FIXED" light materials the game expects).
 ![Import options](images/1.png)
 
 **Preset**
-- `Car` — simple import with textures, ready for rendering.
+- `Car` — simple import with textures, lights and cam, ready for rendering.
 - `Track` — simple import for tracks; lights, cameras and the glass fix are
   turned off.
 - `Light paint` — prepares the import for light painting: forces a split by
@@ -87,7 +90,6 @@ front, disc front, etc.) as a per-vertex colour, separate from the function
 textures painted in the next step. The engine reads a light's front/rear
 side from this vertex colour, not from a texture — so positions are set
 here, once per mesh, before moving on to the more involved texture work.
-Use **Undo paint** rather than Ctrl+Z if you need to walk a change back.
 
 ### 3 - Texture paint
 
@@ -123,6 +125,8 @@ You don't need to undo a paint to change intensity this way. For example:
 paint your daylight mesh with the **Daylight** button; if it's too bright,
 lower the slider and click **Daylight** again — the colour updates in
 place, it isn't added on top of the previous paint.
+you may need to use undo if this part of the texture is already used by an
+existing color.
 
 While **Use data intensity** is on, every channel paints at full intensity
 (1.0).
