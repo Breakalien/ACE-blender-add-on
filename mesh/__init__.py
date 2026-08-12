@@ -2269,7 +2269,42 @@ def _match_mirror_vertices(coords_a: np.ndarray, coords_b_mirrored: np.ndarray, 
     return mapping if len(mapping) == n else None
 
 
-def _find_mirror_pairs(components: list, tol: float) -> tuple:
+_PREPARE_MIRROR_COLOR_TOL = 0.06  # max per-channel mean-colour gap (0..1)
+# still trusted as "the same texture" for mirror-pair purposes - loose enough
+# to absorb sampling/compression noise, tight enough that a red-toned fog
+# light next to a white-toned reverse light (same geometry, deliberately
+# different colour) never passes.
+
+
+def _component_uv_mean_color(comp, uv_layer, img, cache: dict):
+    """Mean colour of `img` sampled *only* under this component's own UV
+    footprint - deliberately not the whole image's mean. Real AC1-era light
+    textures routinely pack a black housing, chrome trim and several
+    differently-coloured lenses into one shared file; comparing whole-image
+    averages made a red lens and an orange indicator (both diluted by the
+    same surrounding black/chrome) read as "close enough", which is exactly
+    how a fog light ended up silently merged with an unrelated part sharing
+    its rough shape. Sampling only the pixels this component actually reads
+    reflects what it really looks like."""
+    if img is None or uv_layer is None or not comp:
+        return None
+    arr = cache.get(img.name)
+    if arr is None:
+        arr = _image_to_array(img)[:, :, :3]
+        cache[img.name] = arr
+    h, w = arr.shape[:2]
+    us, vs = [], []
+    for f in comp:
+        for loop in f.loops:
+            u, v = loop[uv_layer].uv
+            us.append(u % 1.0)
+            vs.append(v % 1.0)
+    xs = (np.array(us) * w).astype(np.int64) % w
+    ys = ((1.0 - np.array(vs)) * h).astype(np.int64) % h
+    return arr[ys, xs].mean(axis=0)
+
+
+def _find_mirror_pairs(components: list, tol: float, face_sources: list = None, uv_layer=None) -> tuple:
     """Compares every pair of connected components for an X=0 mirror match
     *in the mesh's own object space, with no recentring* - two components
     only match if one, X-flipped, actually lands where the other really is.
@@ -2280,15 +2315,45 @@ def _find_mirror_pairs(components: list, tol: float) -> tuple:
     "mirror pair" - car meshes are modelled with X as the left/right axis
     and the origin on the centreline, so comparing raw positions is what
     actually asks "is this genuinely the other side of the same part".
+
+    Geometry alone isn't enough either: a symmetric pair of light housings
+    can be genuinely different parts wearing the same shape - e.g. a rear
+    fog light (red-toned lens) mirrored against a reverse light (white-toned
+    lens), or two unrelated small quads (few enough vertices that shape alone
+    barely constrains the match) that just happen to sit at mirrored
+    positions. Forcing those to share one atlas patch would make every
+    function mask painted on one bleed onto the other. When `face_sources`
+    and `uv_layer` are given, a geometric match is only accepted if both
+    components also look the same where they actually sample their source
+    texture - see _component_uv_mean_color.
+
     Returns (excluded_faces: set[int], vertex_map: {excluded_vert_idx:
     kept_vert_idx}) - the second component of any matched pair is the one
     excluded; its vertices map onto their mirror partner's for UV copying
     after packing."""
+    color_cache: dict = {}
     info = []
     for comp in components:
         verts = list({v for f in comp for v in f.verts})
         coords = np.array([v.co for v in verts], dtype=np.float64)
-        info.append({"faces": comp, "verts": verts, "coords": coords})
+        base_img = None
+        mean_color = None
+        if face_sources is not None and comp:
+            base_img = face_sources[comp[0].index][0]
+            mean_color = _component_uv_mean_color(comp, uv_layer, base_img, color_cache)
+        info.append({
+            "faces": comp, "verts": verts, "coords": coords,
+            "base_img": base_img, "mean_color": mean_color,
+        })
+
+    def _same_texture(mean_a, mean_b):
+        if face_sources is None:
+            return True
+        if mean_a is None and mean_b is None:
+            return True
+        if mean_a is None or mean_b is None:
+            return False
+        return bool(np.all(np.abs(mean_a - mean_b) <= _PREPARE_MIRROR_COLOR_TOL))
 
     excluded_faces: set = set()
     vertex_map: dict = {}
@@ -2301,6 +2366,8 @@ def _find_mirror_pairs(components: list, tol: float) -> tuple:
                 continue
             a, b = info[i], info[j]
             if len(a["verts"]) != len(b["verts"]) or len(a["faces"]) != len(b["faces"]):
+                continue
+            if not _same_texture(a["mean_color"], b["mean_color"]):
                 continue
             mirrored_b = b["coords"].copy()
             mirrored_b[:, 0] *= -1
@@ -2385,7 +2452,8 @@ class MESH_OT_ac_prepare_lights(Operator):
         #    the packing pass entirely; vertex_map lets their UV be copied
         #    from their kept mirror partner afterwards. --
         excluded_faces, mirror_vertex_map = _find_mirror_pairs(
-            _connected_components(bm_final), _PREPARE_MIRROR_TOL)
+            _connected_components(bm_final), _PREPARE_MIRROR_TOL, face_sources,
+            bm_final.loops.layers.uv.active)
 
         target_name = _LIGHT_KIND_MESH_NAMES["PLASTIC"]
         final_mesh = bpy.data.meshes.new(target_name)

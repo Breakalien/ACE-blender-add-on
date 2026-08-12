@@ -168,9 +168,19 @@ class Fmt:
 
 FORMATS = [
     # uncompressed - B8G8R8A8 measured to map to the same kunos value as
-    # R8G8B8A8 (game seems to not distinguish channel order in this enum)
-    Fmt(28, 2, 4, False, 'R8G8B8A8_UNORM'),
+    # R8G8B8A8 (game seems to not distinguish channel order in this enum).
+    # image_to_texture() (below) always writes kunos=2 with plain (R,G,B,A)
+    # byte order, and files written that way read back with correct colours
+    # in-game - so R8G8B8A8 has to be the one that wins the kunos->dxgi
+    # reverse lookup (FORMATS_BY_KUNOS, used by texture_to_dds() whenever we
+    # decode our own output for a Blender preview). Getting this backwards
+    # tags the DDS as BGRA on decode only, which Blender's loader then
+    # renders with red and blue swapped - correct in-game, blue-tinted in
+    # Blender - without the file's actual bytes ever being wrong. B8G8R8A8
+    # is listed first so R8G8B8A8 stays the one defined last, same
+    # "last one wins" convention used below for BC4/BC5.
     Fmt(87, 2, 4, False, 'B8G8R8A8_UNORM'),
+    Fmt(28, 2, 4, False, 'R8G8B8A8_UNORM'),
     Fmt(29, 3, 4, False, 'R8G8B8A8_UNORM_SRGB'),
     Fmt(91, 3, 4, False, 'B8G8R8A8_UNORM_SRGB'),
     # BC1 (DXT1)
