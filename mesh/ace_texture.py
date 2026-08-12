@@ -929,13 +929,129 @@ def image_to_texture(pixels_rgba, width, height):
     default behaviour for a plain PNG with no recognised authoring context
     (verified: it does NOT BC-compress or generate mips for a bare PNG -
     only pre-compressed/pre-mipped DDS input goes through the tiling path).
-    If you need real BC7/mip production output (as used by real car mod
-    textures), pre-compress with e.g. texconv/nvcompress and feed the
-    resulting DDS to dds_to_texture() instead - that path is fully general.
+    Kept for callers that specifically want an uncompressed round trip (the
+    CLI's plain-PNG path, tests); car content itself goes through
+    rgba_to_bc7_texture() below instead, matching what real shipped car
+    textures use.
     """
     meta = Metadata(width, height, 1, FORMATS_BY_DXGI[28].kunos, array_size=1)
     texture = encode_metadata(meta, tile_counts_per_mip=None)
     return texture, pixels_rgba
+
+
+# --------------------------------------------------------------------------
+# BC7_UNORM_SRGB encoding - mode 6 only.
+#
+# BC7 has 8 modes trading subset count/precision/rotation for bit budget;
+# picking the best mode per block (as a production encoder like nvtt or
+# texconv does) is a large undertaking - each mode has its own partition
+# table and bit layout. Mode 6 alone is implemented here: single subset (no
+# partitioning), 7-bit R/G/B/A endpoints each with its own shared P-bit
+# (giving exact 8-bit precision whenever a channel's target byte happens to
+# share its endpoint's parity, ~0.5 LSB off otherwise - visually
+# indistinguishable), and 4-bit (16-step) indices. It is valid for *every*
+# block (no mode-selection heuristics needed) and is the only BC7 mode that
+# carries full independent alpha without a second index set, which is what
+# every texture this project exports through it actually needs: car paint
+# atlases and function masks, i.e. flat colour with clear contrast - the
+# same content BC1 above is tuned for - not photographic detail with sharp
+# per-block colour splits where a partitioned mode would pay for itself.
+# --------------------------------------------------------------------------
+
+_BC7_WEIGHTS4 = _BC6H_WEIGHTS4  # same spec-defined 4-bit interpolation table
+
+
+def encode_bc7_mode6(rgba, width, height, chunk_blocks=8192):
+    """rgba: uint8 array (height, width, 4). Returns raw BC7 mode-6 blocks,
+    row-major - the only BC7 mode implemented, see module note above."""
+    import numpy as np
+    blocks_w = max(1, (width + 3) // 4)
+    blocks_h = max(1, (height + 3) // 4)
+    padded = np.zeros((blocks_h * 4, blocks_w * 4, 4), dtype=np.uint8)
+    padded[:height, :width] = rgba[:height, :width]
+    blocks = (padded.reshape(blocks_h, 4, blocks_w, 4, 4)
+                    .transpose(0, 2, 1, 3, 4)
+                    .reshape(-1, 16, 4).astype(np.int64))
+
+    n = blocks.shape[0]
+    out_lo = np.zeros(n, dtype=np.uint64)
+    out_hi = np.zeros(n, dtype=np.uint64)
+    weights = np.array(_BC7_WEIGHTS4, dtype=np.int64)
+
+    def _best_pbit_endpoint(target):
+        """target: (b, 4) 8-bit RGBA. Returns (v7: (b,4) 0..127, pbit: (b,)) -
+        the shared-parity endpoint (v7<<1)|pbit closest to target across all
+        4 channels at once, tried for both possible p-bit values."""
+        best_err = best_v7 = best_pbit = None
+        for pbit in (0, 1):
+            v7 = np.clip(np.round((target - pbit) / 2.0), 0, 127).astype(np.int64)
+            recon = (v7 << 1) | pbit
+            err = ((recon - target) ** 2).sum(axis=1)
+            if best_err is None:
+                best_err, best_v7 = err, v7
+                best_pbit = np.full(target.shape[0], pbit, dtype=np.int64)
+            else:
+                take = err < best_err
+                best_err = np.where(take, err, best_err)
+                best_v7 = np.where(take[:, None], v7, best_v7)
+                best_pbit = np.where(take, pbit, best_pbit)
+        return best_v7, best_pbit
+
+    for start in range(0, n, chunk_blocks):
+        blk = blocks[start:start + chunk_blocks]  # (b, 16, 4) RGBA
+        e_lo = blk.min(axis=1)  # (b, 4)
+        e_hi = blk.max(axis=1)
+
+        v7_0, p0 = _best_pbit_endpoint(e_lo)
+        v7_1, p1 = _best_pbit_endpoint(e_hi)
+        c0 = (v7_0 << 1) | p0[:, None]
+        c1 = (v7_1 << 1) | p1[:, None]
+
+        pal = (((64 - weights)[None, :, None] * c0[:, None, :]
+                + weights[None, :, None] * c1[:, None, :] + 32) >> 6)  # (b,16,4)
+        diff = blk[:, :, None, :] - pal[:, None, :, :]
+        idx = (diff * diff).sum(axis=3).argmin(axis=2).astype(np.int64)  # (b,16)
+
+        # Anchor (texel 0) index is stored in 3 bits, so its top bit must be
+        # 0; if it isn't, swap the endpoints (and their p-bits) and mirror
+        # every index - same trick as the BC6H encoder above.
+        flip = idx[:, 0] >= 8
+        if flip.any():
+            idx[flip] = 15 - idx[flip]
+            v7_0[flip], v7_1[flip] = v7_1[flip].copy(), v7_0[flip].copy()
+            p0[flip], p1[flip] = p1[flip].copy(), p0[flip].copy()
+
+        u = np.uint64
+        lo = np.full(blk.shape[0], 0x40, dtype=np.uint64)  # mode 6: 6 zero bits then a 1 (bit 6)
+        shift = 7
+        for ch in range(4):  # R, G, B, A endpoint pairs, in channel order
+            lo |= v7_0[:, ch].astype(np.uint64) << u(shift)
+            shift += 7
+            lo |= v7_1[:, ch].astype(np.uint64) << u(shift)
+            shift += 7
+        lo |= p0.astype(np.uint64) << u(63)                 # bit 63: p-bit of endpoint 0
+        hi = p1.astype(np.uint64)                           # bit 64 (hi bit 0): p-bit of endpoint 1
+        hi |= idx[:, 0].astype(np.uint64) << u(1)            # anchor, 3 bits (implicit top bit 0)
+        for k in range(1, 16):
+            hi |= idx[:, k].astype(np.uint64) << u(1 + 3 + (k - 1) * 4)
+
+        out_lo[start:start + blk.shape[0]] = lo
+        out_hi[start:start + blk.shape[0]] = hi
+
+    packed = np.empty((n, 2), dtype="<u8")
+    packed[:, 0] = out_lo
+    packed[:, 1] = out_hi
+    return packed.tobytes()
+
+
+def rgba_to_bc7_texture(rgba, width, height, srgb=True, generate_mips=True):
+    """rgba: uint8 (h, w, 4). Returns (texture_bytes, texturemips_bytes)
+    ready to drop next to the car's other .texture files."""
+    dxgi = 99 if srgb else 98  # BC7_UNORM_SRGB / BC7_UNORM
+    levels = build_mip_chain(rgba, width, height) if generate_mips else [(rgba, width, height)]
+    mips = [encode_bc7_mode6(level, lw, lh) for level, lw, lh in levels]
+    dds = write_dds(DDSImage(width, height, dxgi, mips))
+    return dds_to_texture(dds)
 
 
 # --------------------------------------------------------------------------

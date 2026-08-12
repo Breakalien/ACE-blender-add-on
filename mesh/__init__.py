@@ -3067,7 +3067,10 @@ class MESH_OT_ac_save_ac_texture(Operator):
         rgba[:, :, 3] = 255
 
         try:
-            texture_bytes, mips_bytes = ace_texture.image_to_texture(rgba.tobytes(), w, h)
+            if context.scene.ac_mask_export_format == "RGBA8":
+                texture_bytes, mips_bytes = ace_texture.image_to_texture(rgba.tobytes(), w, h)
+            else:
+                texture_bytes, mips_bytes = ace_texture.rgba_to_bc7_texture(rgba, w, h, srgb=True)
         except Exception as exc:  # noqa: BLE001
             self.report({"ERROR"}, f"Texture encoding failed: {exc}")
             return {"CANCELLED"}
@@ -3511,10 +3514,13 @@ class MESH_OT_ac_export_fixed_materials(Operator):
             return {"CANCELLED"}
         tex_folder = _car_texture_folder()
 
-        def _export_image(image, encode_bc6h: bool, basename: str | None = None) -> str:
+        def _export_image(image, fmt: str, basename: str | None = None) -> str:
             """Writes `image` to the car's texture folder if it isn't already
             an existing car texture, returning the engine-relative path to
-            use in the material either way."""
+            use in the material either way. `fmt` is "BC6H" (normal map),
+            "BC7" (base colour, always compressed) or "MASK" (F1/F2 - format
+            follows the scene's own toggle, RGBA8 vs BC7, since that one's
+            meant to be user-chosen rather than fixed)."""
             existing = _image_existing_path(image)
             if existing:
                 return existing
@@ -3522,18 +3528,27 @@ class MESH_OT_ac_export_fixed_materials(Operator):
                 raise RuntimeError("no texture/ folder found next to meshes/")
             base_name = basename or _clean_texture_basename(image.name)
             w, h = image.size
-            if encode_bc6h:
+            effective_fmt = fmt
+            if effective_fmt == "MASK":
+                effective_fmt = context.scene.ac_mask_export_format
+            if effective_fmt == "BC6H":
                 rgb = _image_to_array(image)[::-1, :, :3]
                 texture_bytes, mips_bytes = ace_texture.rgb_to_bc6h_texture(rgb, w, h)
+                fmt_label = "BC6H_UF16"
             else:
                 rgba = np.clip(_image_to_array(image)[::-1] * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
                 rgba[:, :, 3] = 255
-                texture_bytes, mips_bytes = ace_texture.image_to_texture(rgba.tobytes(), w, h)
+                if effective_fmt == "RGBA8":
+                    texture_bytes, mips_bytes = ace_texture.image_to_texture(rgba.tobytes(), w, h)
+                    fmt_label = "RGBA8"
+                else:
+                    texture_bytes, mips_bytes = ace_texture.rgba_to_bc7_texture(rgba, w, h, srgb=True)
+                    fmt_label = "BC7_UNORM_SRGB"
             with open(os.path.join(tex_folder, f"{base_name}.texture"), "wb") as fh:
                 fh.write(texture_bytes)
             with open(os.path.join(tex_folder, f"{base_name}.texturemips"), "wb") as fh:
                 fh.write(mips_bytes)
-            written_textures.append(f"{base_name}.texture ({w}x{h}, {'BC6H_UF16' if encode_bc6h else 'RGBA8'})")
+            written_textures.append(f"{base_name}.texture ({w}x{h}, {fmt_label})")
             return f"{car_prefix}\\texture\\{base_name}.texture"
 
         done, skipped, written_textures = [], [], []
@@ -3554,7 +3569,7 @@ class MESH_OT_ac_export_fixed_materials(Operator):
             texture_slot = "F1" if slot == "FunctionMask1" else "F2"
             base_name = _mask_output_name(context, texture_slot, painted)
             try:
-                mask_paths[slot] = _export_image(export_source, encode_bc6h=False, basename=base_name)
+                mask_paths[slot] = _export_image(export_source, fmt="MASK", basename=base_name)
             except Exception as exc:  # noqa: BLE001
                 self.report({"WARNING"}, f"Could not export {slot}: {exc}")
 
@@ -3579,7 +3594,7 @@ class MESH_OT_ac_export_fixed_materials(Operator):
 
             try:
                 base_img = _find_base_color_image(mat)
-                base_color_path = _export_image(base_img, encode_bc6h=False) if base_img is not None else None
+                base_color_path = _export_image(base_img, fmt="BC7") if base_img is not None else None
                 # The generated normal map (scene.ac_normal_map_image, from
                 # "Generate normal map") is the one and only normal source
                 # here - each kind's checkbox just decides whether to apply
@@ -3590,7 +3605,7 @@ class MESH_OT_ac_export_fixed_materials(Operator):
                 normal_source = context.scene.ac_normal_map_image
                 normal_img = normal_source if (normal_wanted and normal_source is not None
                                                 and normal_source.size[0] > 0) else None
-                normal_path = _export_image(normal_img, encode_bc6h=True) if normal_img is not None else None
+                normal_path = _export_image(normal_img, fmt="BC6H") if normal_img is not None else None
 
                 mf = material_codec.decode_material(_bundled_kind_preset_path(kind))
                 for tex in mf.textures:
@@ -3808,7 +3823,8 @@ class VIEW3D_PT_ac_export(Panel):
 
         folder = _car_texture_folder()
         box = layout.box()
-        box.label(text="Textures -> game format (uncompressed RGBA8)")
+        box.label(text="Textures -> game format")
+        box.prop(scene, "ac_mask_export_format", text="Format")
         row = box.row(align=True)
         row.enabled = folder is not None
         row.operator("mesh.ac_save_ac_texture", text="Save F_1", icon="EXPORT").texture_slot = "F1"
@@ -3953,6 +3969,19 @@ def register():
         description="Resolution of the Prepare atlas texture (always square)",
         items=[("1024", "1024", ""), ("2048", "2048", ""), ("4096", "4096", "")],
         default="2048",
+    )
+    bpy.types.Scene.ac_mask_export_format = EnumProperty(
+        name="F1/F2 format",
+        description=(
+            "Texture format for Save F_1/F_2 (and the F1/F2 masks written by "
+            "Export FIXED materials) - the base colour atlas and normal map "
+            "are unaffected, always BC7/BC6H respectively"
+        ),
+        items=[
+            ("BC7", "BC7", "Compressed, matches shipped car content"),
+            ("RGBA8", "RGBA8", "Uncompressed - different look in-game, larger files"),
+        ],
+        default="RGBA8",
     )
     bpy.types.Scene.ac_export_plastic_normal = BoolProperty(
         name="Plastic normal map",
