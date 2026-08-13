@@ -341,6 +341,16 @@ class IMPORT_OT_ac_mesh(Operator, ImportHelper):
         ),
         default=True,
     )
+    mesh_cleaning: BoolProperty(
+        name="Mesh cleaning",
+        description=(
+            "Off by default: every mesh is imported exactly as stored, nothing merged or removed. "
+            "Turn this on to run the same coincident-duplicate-triangle removal as 'Clean selected "
+            "mesh' on every object right after import (triangles whose 3 corners sit at the same "
+            "position as another triangle's, independent of winding or which vertices they use)."
+        ),
+        default=False,
+    )
 
     def execute(self, context):
         if self.files and len(self.files) > 1:
@@ -419,7 +429,7 @@ class IMPORT_OT_ac_mesh(Operator, ImportHelper):
 
         image_cache: dict[str, bpy.types.Image] = {}
         active_obj = None
-        skipped_duplicate_faces = 0
+        cleaned_faces = 0
         try:
             for lod_index, lod in lods_to_import:
                 lod_name = base_name if len(lods_to_import) == 1 else f"{base_name}_LOD{lod_index}"
@@ -458,7 +468,8 @@ class IMPORT_OT_ac_mesh(Operator, ImportHelper):
                     context.collection.objects.link(obj)
                     obj.select_set(True)
                     active_obj = obj
-                    skipped_duplicate_faces += obj.data.get("ac_skipped_duplicate_faces", 0)
+                    if self.mesh_cleaning:
+                        cleaned_faces += _clean_duplicate_faces(obj)
                 elif self.split_mode == "MATERIAL":
                     used_ranges = [mr for mr in lod.materials if mr.count > 0]
                     group = bpy.data.objects.new(geo_name, None)
@@ -479,7 +490,8 @@ class IMPORT_OT_ac_mesh(Operator, ImportHelper):
                         context.collection.objects.link(obj)
                         obj.select_set(True)
                         active_obj = obj
-                        skipped_duplicate_faces += obj.data.get("ac_skipped_duplicate_faces", 0)
+                        if self.mesh_cleaning:
+                            cleaned_faces += _clean_duplicate_faces(obj)
                 else:  # RIGID_PART
                     group = bpy.data.objects.new(geo_name, None)
                     group[_PROP_SOURCE_PATH] = filepath
@@ -514,7 +526,8 @@ class IMPORT_OT_ac_mesh(Operator, ImportHelper):
                             obj.parent = group
                         obj.select_set(True)
                         active_obj = obj
-                        skipped_duplicate_faces += obj.data.get("ac_skipped_duplicate_faces", 0)
+                        if self.mesh_cleaning:
+                            cleaned_faces += _clean_duplicate_faces(obj)
 
                 if axis_root is not None:
                     axis_root.select_set(True)
@@ -531,11 +544,11 @@ class IMPORT_OT_ac_mesh(Operator, ImportHelper):
 
         summary = ", ".join(f"LOD{i} ({lod.vertex_count}v/{lod.triangle_count}t)" for i, lod in lods_to_import)
         warnings = []
-        if skipped_duplicate_faces:
+        if cleaned_faces:
             warnings.append(
-                f"{base_name}: {skipped_duplicate_faces} duplicate triangle(s) (same 3 vertices) in the source file "
-                "could not be represented in Blender and were skipped - no visual difference (pure overdraw), "
-                "but the export will produce that many fewer triangles for those LOD(s).",
+                f"{base_name}: Mesh cleaning removed {cleaned_faces} coincident duplicate triangle(s) "
+                "(same 3 corner positions as another triangle) - no visual difference, but the export "
+                "will produce that many fewer triangles for those LOD(s).",
             )
         if material_resolver is not None and (material_resolver.warnings or material_resolver.textures.warnings):
             warnings.extend(material_resolver.warnings + material_resolver.textures.warnings)
@@ -748,30 +761,39 @@ def _build_object_from_lod(
 
     bm_verts = [bm.verts.new(p) for p in lod.positions]
     bm.verts.ensure_lookup_table()
+    # Maps each bmesh vert's eventual mesh index -> the lod.* array index to
+    # read its UV/bone/extra data from. 1:1 with lod.positions until a
+    # duplicate-face vertex copy (below) appends to it.
+    vert_source_index = list(range(len(lod.positions)))
 
-    skipped = 0
     for start_idx in range(0, len(lod.indices), 3):
         a, b, c = lod.indices[start_idx:start_idx + 3]
         try:
             bm.faces.new((bm_verts[a], bm_verts[b], bm_verts[c]))
         except ValueError:
-            # Genuinely duplicate triangle (same 3 vertices) in the source data -
-            # seen on some decimated low LODs. Blender can't store two faces
-            # sharing an identical vertex set, and since they'd render as pure
-            # overdraw of the exact same triangle, dropping it changes nothing
-            # visually.
-            skipped += 1
+            # Genuinely duplicate triangle (same 3 vertices) in the source data
+            # - seen on some decimated low LODs. Blender can't store two faces
+            # sharing an identical vertex set, so this one gets its own private
+            # vertex copies instead, at the same positions - keeps import
+            # itself lossless always; "Mesh cleaning" (on request, see
+            # _clean_duplicate_faces) is what decides afterwards whether
+            # coincident duplicates like this one should stay or go.
+            new_verts = []
+            for vi in (a, b, c):
+                nv = bm.verts.new(lod.positions[vi])
+                vert_source_index.append(vi)
+                new_verts.append(nv)
+            bm.faces.new(new_verts)
 
     bm.to_mesh(mesh)
     bm.free()
-    if skipped:
-        mesh["ac_skipped_duplicate_faces"] = skipped
 
     uv_layer = mesh.uv_layers.new(name="UVMap")
     for poly in mesh.polygons:
         for loop_index, vert_index in zip(poly.loop_indices, poly.vertices):
-            if vert_index < len(lod.uv0):
-                u, v = lod.uv0[vert_index]
+            src_index = vert_source_index[vert_index] if vert_index < len(vert_source_index) else vert_index
+            if src_index < len(lod.uv0):
+                u, v = lod.uv0[src_index]
             else:
                 u, v = 0.0, 0.0
             # DirectX -> Blender/OpenGL V convention. Confirmed correct against
@@ -814,12 +836,16 @@ def _build_object_from_lod(
         poly.use_smooth = True
 
     bone_attr = mesh.attributes.new(_BONE_ATTR, "INT", "POINT")
-    for i, bi in enumerate(lod.bone_indices):
+    for i in range(len(mesh.vertices)):
+        src_index = vert_source_index[i] if i < len(vert_source_index) else i
+        bi = lod.bone_indices[src_index] if src_index < len(lod.bone_indices) else None
         bone_attr.data[i].value = bi[0] if bi else 0
 
     extra_attr = mesh.attributes.new(_EXTRA_ATTR, "FLOAT_COLOR", "POINT")
-    for i, ex in enumerate(lod.extra):
-        extra_attr.data[i].color = ex if len(ex) == 4 else (0.0, 0.0, 0.0, 0.0)
+    for i in range(len(mesh.vertices)):
+        src_index = vert_source_index[i] if i < len(vert_source_index) else i
+        ex = lod.extra[src_index] if src_index < len(lod.extra) else None
+        extra_attr.data[i].color = ex if ex is not None and len(ex) == 4 else (0.0, 0.0, 0.0, 0.0)
     # Without this, Blender never renders ac_extra in the viewport (Solid
     # shading's "Attribute"/"Vertex" colour mode, and the default colour
     # attribute node in Material Preview/Rendered, both only ever show the
@@ -2398,6 +2424,73 @@ _NORMAL_TOGGLE_PROP = {
 
 _PREPARE_UV_MARGIN = 0.015
 _PREPARE_MIRROR_TOL = 1e-3
+_CLEAN_MESH_POS_NDIGITS = 5  # rounding precision (metres) for "same point"
+
+
+def _clean_duplicate_faces(obj: bpy.types.Object) -> int:
+    """Removes triangles whose 3 corners sit at the same *positions* as
+    another triangle already kept, independent of winding or which actual
+    vertex objects they use. This is the post-import counterpart of the
+    exact-index duplicate check done at import time: "Disable mesh cleaning"
+    (on import) gives a coincident duplicate triangle its own private vertex
+    copies specifically so it CAN coexist in the same bmesh (import can't
+    otherwise represent it at all) - this is what lets it be found and
+    removed again afterwards, once it's no longer needed, without having to
+    decide at import time. Also drops any vertex left with zero faces as a
+    result. Returns the number of faces removed."""
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+
+    def key_of(face):
+        return frozenset(
+            (round(v.co.x, _CLEAN_MESH_POS_NDIGITS),
+             round(v.co.y, _CLEAN_MESH_POS_NDIGITS),
+             round(v.co.z, _CLEAN_MESH_POS_NDIGITS))
+            for v in face.verts
+        )
+
+    seen: set = set()
+    dup_faces = []
+    for f in bm.faces:
+        key = key_of(f)
+        if key in seen:
+            dup_faces.append(f)
+        else:
+            seen.add(key)
+
+    if dup_faces:
+        bmesh.ops.delete(bm, geom=dup_faces, context="FACES")
+        loose = [v for v in bm.verts if not v.link_faces]
+        if loose:
+            bmesh.ops.delete(bm, geom=loose, context="VERTS")
+        bm.to_mesh(mesh)
+        mesh.update()
+    bm.free()
+    return len(dup_faces)
+
+
+class MESH_OT_ac_clean_selected_mesh(Operator):
+    """Runs _clean_duplicate_faces on every currently selected mesh object -
+    the general-purpose version of 'Clean lights mesh', for anything else
+    imported with 'Disable mesh cleaning' on."""
+    bl_idname = "mesh.ac_clean_selected_mesh"
+    bl_label = "Clean selected mesh"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects if o.type == "MESH"]
+        if not targets:
+            self.report({"ERROR"}, "Select at least one mesh in the Outliner/viewport.")
+            return {"CANCELLED"}
+        total, touched = 0, 0
+        for obj in targets:
+            removed = _clean_duplicate_faces(obj)
+            total += removed
+            touched += 1 if removed else 0
+        self.report({"INFO"}, f"Removed {total} coincident duplicate face(s) across {touched} mesh(es).")
+        return {"FINISHED"}
 
 
 class MESH_OT_ac_prepare_lights(Operator):
@@ -2429,21 +2522,33 @@ class MESH_OT_ac_prepare_lights(Operator):
             self.report({"ERROR"}, "No object with 'EXT_LIGHTS' in its name found.")
             return {"CANCELLED"}
 
+        cleaned_faces = 0
+        if context.scene.ac_clean_lights_before_prepare:
+            for obj in candidates:
+                cleaned_faces += _clean_duplicate_faces(obj)
+
         old_material_names = {
             obj.data.materials[0].name for obj in candidates if obj.data.materials
         }
 
         # -- merge every object's geometry, remembering which (base, normal)
-        #    image pair each contributed face should sample from at bake time --
+        #    image pair each contributed face should sample from at bake time,
+        #    and which vertex range came from which source material (-> a
+        #    vertex group per material below, so a part stays selectable
+        #    after the merge without having to hand-pick faces again) --
         bm_final = bmesh.new()
         face_sources = []  # parallel to the merged mesh's eventual polygon order
+        vert_group_ranges: dict[str, list] = {}
         for obj in candidates:
             mat = obj.data.materials[0] if obj.data.materials else None
+            group_name = mat.name if mat is not None else obj.name
             base_img = _find_base_color_image(mat) if mat is not None else None
             normal_img = _find_normal_map_image(mat) if mat is not None else None
-            before = len(bm_final.faces)
+            before_faces = len(bm_final.faces)
+            before_verts = len(bm_final.verts)
             bm_final.from_mesh(obj.data)
-            face_sources.extend([(base_img, normal_img)] * (len(bm_final.faces) - before))
+            face_sources.extend([(base_img, normal_img)] * (len(bm_final.faces) - before_faces))
+            vert_group_ranges.setdefault(group_name, []).append((before_verts, len(bm_final.verts)))
 
         # -- detect bilateral (X-mirror) duplicate parts (a symmetric car's
         #    left/right light sharing the same texture patch is normal, and
@@ -2473,6 +2578,11 @@ class MESH_OT_ac_prepare_lights(Operator):
             final_obj[_PROP_SOURCE_PATH] = src_path
         if lod_index is not None:
             final_obj[_PROP_LOD_INDEX] = lod_index
+
+        for group_name, ranges in vert_group_ranges.items():
+            vg = final_obj.vertex_groups.new(name=group_name)
+            for start, end in ranges:
+                vg.add(list(range(start, end)), 1.0, "REPLACE")
 
         # -- duplicate the original UV into a second layer, then repack that
         #    copy so every island (regardless of which source object it came
@@ -2626,7 +2736,8 @@ class MESH_OT_ac_prepare_lights(Operator):
             f"Prepare: merged {len(candidates)} object(s), repacked and rebaked into "
             f"'{target_name}' ({size}x{size} atlas), {len(removed_materials)} unused material(s) removed"
             + (f", {len(excluded_faces)} mirror-duplicate face(s) sharing texture with their twin." if excluded_faces else ".")
-            + (f" Reference '{ref_bw.name}' and normal map '{generated_nm.name}' auto-generated." if generated_nm else ""),
+            + (f" Reference '{ref_bw.name}' and normal map '{generated_nm.name}' auto-generated." if generated_nm else "")
+            + (f" {cleaned_faces} coincident duplicate face(s) cleaned first." if cleaned_faces else ""),
         )
         return {"FINISHED"}
 
@@ -3670,6 +3781,8 @@ class VIEW3D_PT_ac_input(Panel):
         box.label(text="Prepare (join EXT_LIGHTS_* by texture)")
         box.operator("mesh.ac_prepare_lights", text="Prepare", icon="MOD_BOOLEAN")
         box.prop(scene, "ac_prepare_atlas_size", text="Atlas size")
+        box.prop(scene, "ac_clean_lights_before_prepare")
+        box.operator("mesh.ac_clean_selected_mesh", text="Clean selected mesh", icon="TRASH")
 
 
 class VIEW3D_PT_ac_vertex_paint(Panel):
@@ -3941,6 +4054,7 @@ def _menu_func_export(self, context):
 _classes = (
     IMPORT_OT_ac_mesh, EXPORT_OT_ac_mesh,
     MESH_OT_ac_paint_position, MESH_OT_ac_erase_vcolor, MESH_OT_ac_erase_all_vcolor,
+    MESH_OT_ac_clean_selected_mesh,
     MESH_OT_ac_prepare_lights, MESH_OT_ac_split_light_kind,
     MESH_OT_ac_create_light_texture, MESH_OT_ac_ref_from_material, MESH_OT_ac_generate_normal_map,
     MESH_OT_ac_undo_paint, MESH_OT_ac_bake_lights, MESH_OT_ac_save_ac_texture,
@@ -3969,6 +4083,16 @@ def register():
         description="Resolution of the Prepare atlas texture (always square)",
         items=[("1024", "1024", ""), ("2048", "2048", ""), ("4096", "4096", "")],
         default="2048",
+    )
+    bpy.types.Scene.ac_clean_lights_before_prepare = BoolProperty(
+        name="Clean lights mesh first",
+        description=(
+            "Before merging, remove coincident duplicate triangles (same 3 corner positions as "
+            "another triangle) from every EXT_LIGHTS_* object - the post-import counterpart of "
+            "'Disable mesh cleaning' on import. On by default; only matters if that import option "
+            "was used, otherwise there's nothing to clean"
+        ),
+        default=True,
     )
     bpy.types.Scene.ac_mask_export_format = EnumProperty(
         name="F1/F2 format",
