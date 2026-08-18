@@ -937,6 +937,10 @@ def _wire_material_textures(mat: bpy.types.Material, resolved, image_cache: dict
     if bsdf is None:
         return
 
+    if resolved.channels:
+        _wire_channel_material(mat, resolved.channels, image_cache, temp_dir)
+        return
+
     if not (resolved.diffuse_texture or resolved.normal_texture or resolved.opacity_texture):
         r, g, b = resolved.diffuse_color
         bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
@@ -980,6 +984,143 @@ def _wire_material_textures(mat: bpy.types.Material, resolved, image_cache: dict
         tex_node.label = "AC Opacity"
         tex_node.location = (-400, y)
         links.new(tex_node.outputs["Color"], bsdf.inputs["Alpha"])
+        for method in ("CLIP", "HASHED", "BLEND"):
+            try:
+                mat.blend_method = method
+                break
+            except (TypeError, AttributeError):
+                continue
+
+
+_CHANNEL_GROUP_SOCKETS = [
+    # (ChannelMaterial field, group output socket name, colourspace)
+    ("base_color_texture", "Base Color", "sRGB"),
+    ("normal_texture", "Normal", "Non-Color"),
+    ("ao_texture", "Ambient Occlusion", "Non-Color"),
+    ("anisotropy_texture", "Anisotropy", "Non-Color"),
+    ("metalness_texture", "Metalness", "Non-Color"),
+    ("opacity_texture", "Opacity", "Non-Color"),
+]
+
+
+def _build_channel_group(channel, image_cache: dict, temp_dir: str | None) -> bpy.types.NodeTree:
+    """One small node group per active Base/Red/Green/Blue channel: samples
+    whichever of its 6 maps are actually assigned, through a Mapping node
+    scaled by the channel's own UVscale, and exposes each as a Color output.
+    A map this channel doesn't have comes out as white - a no-op for the
+    multiply chain _wire_channel_material builds across channels - except
+    Base Color specifically, which falls back to the channel's own constant
+    paint colour (or mid-grey, if it has neither)."""
+    group = bpy.data.node_groups.new(f"AC_{channel.prefix}channel", "ShaderNodeTree")
+    nodes, links = group.nodes, group.links
+    for _field, socket_name, _cs in _CHANNEL_GROUP_SOCKETS:
+        group.interface.new_socket(socket_name, in_out="OUTPUT", socket_type="NodeSocketColor")
+    group_out = nodes.new("NodeGroupOutput")
+    group_out.location = (600, 0)
+
+    uv_node = nodes.new("ShaderNodeUVMap")
+    uv_node.location = (-900, 0)
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.location = (-700, 0)
+    mapping.inputs["Scale"].default_value = (channel.uv_scale[0], channel.uv_scale[1], 1.0)
+    links.new(uv_node.outputs["UV"], mapping.inputs["Vector"])
+
+    y = 300
+    for field_name, socket_name, colorspace in _CHANNEL_GROUP_SOCKETS:
+        converted_path = getattr(channel, field_name)
+        if converted_path:
+            img = _load_image_cached(converted_path, colorspace, image_cache, temp_dir)
+            engine_path = getattr(channel, field_name.replace("_texture", "_raw"), None)
+            if engine_path:
+                img[_PROP_TEXTURE_PATH] = engine_path
+            tex_node = nodes.new("ShaderNodeTexImage")
+            tex_node.image = img
+            tex_node.label = f"{channel.prefix}{socket_name}"
+            tex_node.location = (-400, y)
+            links.new(mapping.outputs["Vector"], tex_node.inputs["Vector"])
+            links.new(tex_node.outputs["Color"], group_out.inputs[socket_name])
+        else:
+            const = channel.base_color_const if (socket_name == "Base Color" and channel.base_color_const) else None
+            rgb_node = nodes.new("ShaderNodeRGB")
+            rgb_node.label = f"{channel.prefix}{socket_name} (default)"
+            rgb_node.location = (-400, y)
+            rgb_node.outputs[0].default_value = (*const, 1.0) if const else (1.0, 1.0, 1.0, 1.0)
+            links.new(rgb_node.outputs[0], group_out.inputs[socket_name])
+        y -= 250
+
+    return group
+
+
+def _wire_channel_material(mat: bpy.types.Material, channels: list, image_cache: dict, temp_dir: str | None) -> None:
+    """Wires the layered Base/Red/Green/Blue channel system: one node group
+    per active channel (_build_channel_group), then Base x Red x Green x Blue
+    multiplied together independently for each of the 6 properties - the
+    final Base Color and Ambient Occlusion results are multiplied together
+    into the Principled BSDF's Base Color (no dedicated AO input exists
+    there), Normal goes through a Normal Map node, Metalness/Anisotropy feed
+    the matching BSDF inputs directly, and Opacity feeds Alpha (only wired,
+    with the material switched out of opaque rendering, if at least one
+    channel actually has an opacity map)."""
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+
+    group_nodes = []
+    x = -1400
+    for channel in channels:
+        group_tree = _build_channel_group(channel, image_cache, temp_dir)
+        gnode = nodes.new("ShaderNodeGroup")
+        gnode.node_tree = group_tree
+        gnode.label = channel.prefix.rstrip("_")
+        gnode.location = (x, 300)
+        x += 220
+        group_nodes.append(gnode)
+
+    def multiply_chain(socket_name: str, y: float):
+        current = group_nodes[0].outputs[socket_name]
+        mix_x = x + 100
+        for gnode in group_nodes[1:]:
+            mix = nodes.new("ShaderNodeMixRGB")
+            mix.blend_type = "MULTIPLY"
+            mix.inputs["Factor"].default_value = 1.0
+            mix.location = (mix_x, y)
+            links.new(current, mix.inputs["Color1"])
+            links.new(gnode.outputs[socket_name], mix.inputs["Color2"])
+            current = mix.outputs["Color"]
+            mix_x += 200
+        return current
+
+    final_base_color = multiply_chain("Base Color", 400)
+    final_normal = multiply_chain("Normal", 100)
+    final_ao = multiply_chain("Ambient Occlusion", -200)
+    final_anisotropy = multiply_chain("Anisotropy", -500)
+    final_metalness = multiply_chain("Metalness", -800)
+
+    ao_mix = nodes.new("ShaderNodeMixRGB")
+    ao_mix.blend_type = "MULTIPLY"
+    ao_mix.label = "Base Color x AO (no BSDF AO input)"
+    ao_mix.inputs["Factor"].default_value = 1.0
+    ao_mix.location = (x + 900, 400)
+    links.new(final_base_color, ao_mix.inputs["Color1"])
+    links.new(final_ao, ao_mix.inputs["Color2"])
+
+    normal_map_node = nodes.new("ShaderNodeNormalMap")
+    normal_map_node.location = (x + 900, 100)
+    links.new(final_normal, normal_map_node.inputs["Color"])
+
+    links.new(ao_mix.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(normal_map_node.outputs["Normal"], bsdf.inputs["Normal"])
+    links.new(final_anisotropy, bsdf.inputs["Anisotropic"])
+    links.new(final_metalness, bsdf.inputs["Metallic"])
+
+    # Only wire Alpha (and switch the material out of opaque rendering) if a
+    # channel actually carries an opacity map - a channel with none is
+    # treated as fully opaque (white, same neutral-multiply convention as
+    # the other maps), so leaving Alpha at its default 1.0 unconnected for
+    # an all-opaque material avoids needlessly blending/dithering it.
+    if any(c.opacity_texture for c in channels):
+        final_opacity = multiply_chain("Opacity", -1100)
+        links.new(final_opacity, bsdf.inputs["Alpha"])
         for method in ("CLIP", "HASHED", "BLEND"):
             try:
                 mat.blend_method = method
@@ -2065,17 +2206,40 @@ def _find_linked_image(mat: bpy.types.Material, socket_name: str):
     if socket is None or not socket.is_linked:
         return None
 
+    # Each queue entry also carries the specific *output socket* it was
+    # reached through - needed once a GROUP node is involved, since one
+    # group bundles several independent pipelines (Base Color, Normal, AO,
+    # ...) behind one Group Output; without tracking which socket the outer
+    # link actually used, descending into the group would just as happily
+    # return an image feeding a *different* one of its outputs.
     seen = set()
-    queue = [link.from_node for link in socket.links]
+    queue = [(link.from_node, link.from_socket) for link in socket.links]
     while queue:
-        node = queue.pop(0)
-        if node.name in seen:
+        node, from_socket = queue.pop(0)
+        key = (node.name, from_socket.identifier if from_socket else None)
+        if key in seen:
             continue
-        seen.add(node.name)
+        seen.add(key)
         if node.type == "TEX_IMAGE" and node.image is not None:
             return node.image
+        if node.type == "GROUP" and node.node_tree is not None:
+            # A node group's own `.inputs` are its *external* sockets (fed
+            # from outside) - the actual wiring is inside node.node_tree, so
+            # continue the search from its Group Output node instead of
+            # treating the group as a dead end. Needed for the layered
+            # Base/Red/Green/Blue channel materials (_wire_material_textures),
+            # which hide their image textures one level down inside a group
+            # per channel - only the internal input matching the specific
+            # output socket used to reach this group is followed, the
+            # group's other, unrelated pipelines are left alone.
+            group_output = next((n for n in node.node_tree.nodes if n.type == "GROUP_OUTPUT"), None)
+            if group_output is not None and from_socket is not None:
+                inner_socket = group_output.inputs.get(from_socket.name)
+                if inner_socket is not None:
+                    queue.extend((link.from_node, link.from_socket) for link in inner_socket.links)
+            continue
         for inp in node.inputs:
-            queue.extend(link.from_node for link in inp.links)
+            queue.extend((link.from_node, link.from_socket) for link in inp.links)
     return None
 
 

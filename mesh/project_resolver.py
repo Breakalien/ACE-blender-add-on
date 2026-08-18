@@ -36,10 +36,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .ace_texture import texture_to_dds
-from .material_codec import decode_material, MaterialFile, KIND_VEC2, KIND_VEC3, KIND_VEC4
+from .material_codec import decode_material, MaterialFile, KIND_SCALAR, KIND_VEC2, KIND_VEC3, KIND_VEC4
 
 _SPLIT_RE = re.compile(r"[\\/]+")
 
@@ -188,6 +188,42 @@ class ResolvedMaterial:
     diffuse_color: tuple = (0.8, 0.8, 0.8)  # constant paint colour, used as-is when there's no diffuse texture
     diffuse_raw: str | None = None  # engine-relative Base_BaseColorMap path
     normal_raw: str | None = None  # engine-relative Base_NormalMap path
+    channels: list = field(default_factory=list)  # ChannelMaterial, see below - populated
+    # instead of (not alongside) the fields above whenever the material
+    # actually uses the layered Base/Red/Green/Blue system; empty otherwise.
+
+
+@dataclass
+class ChannelMaterial:
+    """One of up to 4 paint layers (Base/Red/Green/Blue) an UberVehicleMaterial-
+    family material can blend together, each with its own full set of maps and
+    its own UV tiling. Red/Green/Blue only exist when their own "<prefix>Enable"
+    property is set - Base always does. The car's Blender material wires these
+    as one small node group per channel, then multiplies Base x Red x Green x
+    Blue together for every one of the 5 properties independently to get the
+    material's final Base Color/Normal/AmbientOcclusion/Anisotropy/Metalness."""
+    prefix: str  # "Base_", "Red_", "Green_" or "Blue_"
+    uv_scale: tuple = (1.0, 1.0)
+    base_color_texture: str | None = None
+    base_color_const: tuple | None = None  # (r, g, b) - used when base_color_texture is None
+    normal_texture: str | None = None
+    ao_texture: str | None = None
+    anisotropy_texture: str | None = None
+    metalness_texture: str | None = None
+    opacity_texture: str | None = None  # no constant-opacity property exists on any
+    # sampled material - a channel with no opacity texture is simply opaque (1.0),
+    # same neutral-multiply convention as normal/AO/anisotropy/metalness.
+    # Engine-relative ("content\\cars\\...") counterpart of each *_texture
+    # field above - lets the Blender image get tagged with where it really
+    # came from, same as the simple diffuse/normal path (ResolvedMaterial.
+    # diffuse_raw/normal_raw), so an exporter can tell "reuse this existing
+    # file" apart from "this needs writing out as new".
+    base_color_raw: str | None = None
+    normal_raw: str | None = None
+    ao_raw: str | None = None
+    anisotropy_raw: str | None = None
+    metalness_raw: str | None = None
+    opacity_raw: str | None = None
 
 
 class TextureConverter:
@@ -339,6 +375,93 @@ def _uv_scale_for_slot(mf: MaterialFile, slot_name: str | None) -> tuple:
     return (1.0, 1.0)
 
 
+# -- UberVehicleMaterial's layered Base/Red/Green/Blue channel system --
+#
+# Up to 4 paint layers can be blended on one material: Base is always
+# present, Red/Green/Blue only when their own "<prefix>Enable" property is 1
+# (this is what the game reads a mesh's vertex-colour R/G/B channel against
+# to decide how much of each layer shows where). Each layer independently
+# carries the same 5 kinds of map - BaseColor, Normal, AmbientOcclusion,
+# Anisotropy, Metalness - each behind its own "<prefix>Has<Map>" flag (1 =
+# texture in "<prefix><Map>", 0 = ignore/use the constant colour for
+# BaseColor), and its own UV tiling ("<prefix>UVscale").
+_CHANNEL_ENABLE_PROPERTY = {"Red_": "Red_Enable", "Green_": "Green_Enable", "Blue_": "Blue_Enable"}
+_CHANNEL_SUBMAPS = [
+    # (ChannelMaterial field, texture slot suffix, "Has..." property suffix)
+    ("base_color_texture", "BaseColorMap", "HasBaseColorMap"),
+    ("normal_texture", "NormalMap", "HasNormalMap"),
+    ("ao_texture", "AmbientOcclusionMap", "HasAmbientOcclusionMap"),
+    ("anisotropy_texture", "AnisotropyMap", "HasAnisotropyMap"),
+    ("metalness_texture", "MetalnessMap", "HasMetalnessMap"),
+    ("opacity_texture", "OpacityMap", "HasOpacityMap"),
+]
+
+
+def _prop_scalar(mf: MaterialFile, name: str, default: float = 0.0) -> float:
+    for p in mf.properties:
+        if p.name == name and p.kind == KIND_SCALAR:
+            return p.get(1, default)
+    return default
+
+
+def _prop_vec3(mf: MaterialFile, name: str) -> tuple | None:
+    for p in mf.properties:
+        if p.name == name and p.kind in (KIND_VEC3, KIND_VEC4):
+            return (p.get(1, 0.0), p.get(2, 0.0), p.get(3, 0.0))
+    return None
+
+
+def _prop_vec2(mf: MaterialFile, name: str, default: tuple = (1.0, 1.0)) -> tuple:
+    for p in mf.properties:
+        if p.name == name and p.kind == KIND_VEC2:
+            return (p.get(1, default[0]), p.get(2, default[1]))
+    return default
+
+
+def is_uber_channel_material(mf: MaterialFile) -> bool:
+    """True if this material actually uses the layered Base_/Red_/Green_/
+    Blue_ system at all (vs. a legacy shader with plain txDiffuse/txNormal
+    slots and no per-channel properties) - cheap presence check on the Base_
+    prefix alone, since Base is mandatory whenever the system is used."""
+    return any(p.name.startswith("Base_") for p in mf.properties) or \
+        any(t.name.startswith("Base_") for t in mf.textures)
+
+
+def _channel_map_active(mf: MaterialFile, prop_name: str, tex_by_name: dict, slot_name: str) -> bool:
+    """True if this channel's map should be used. Prefers the explicit
+    "<prefix>Has<Map>" flag; materials that don't carry one at all (older/
+    simpler shaders like VehicleLight, which only ever use the Base channel
+    and rely on a texture slot's mere presence to mean "use it") fall back
+    to whether the slot itself actually has a path - absence of the flag is
+    NOT the same as it being explicitly set to 0."""
+    for p in mf.properties:
+        if p.name == prop_name and p.kind == KIND_SCALAR:
+            return p.get(1, 0.0) == 1.0
+    return bool(tex_by_name.get(slot_name))
+
+
+def resolve_channels(mf: MaterialFile, tex_by_name: dict, textures: "TextureConverter") -> list:
+    """Builds one ChannelMaterial per active layer (Base, plus Red/Green/Blue
+    when enabled), each with its maps already resolved to real files via
+    `textures` - ready for a caller to wire into per-channel node groups."""
+    channels = []
+    for prefix in CHANNEL_PREFIXES:
+        enable_prop = _CHANNEL_ENABLE_PROPERTY.get(prefix)
+        if enable_prop is not None and _prop_scalar(mf, enable_prop) != 1.0:
+            continue
+        kwargs = {"prefix": prefix, "uv_scale": _prop_vec2(mf, f"{prefix}UVscale")}
+        for field_name, slot_suffix, has_suffix in _CHANNEL_SUBMAPS:
+            slot_name = f"{prefix}{slot_suffix}"
+            has_map = _channel_map_active(mf, f"{prefix}{has_suffix}", tex_by_name, slot_name)
+            raw_path = tex_by_name.get(slot_name) if has_map else None
+            kwargs[field_name] = textures.convert(raw_path) if raw_path else None
+            kwargs[field_name.replace("_texture", "_raw")] = raw_path if kwargs[field_name] else None
+        if kwargs["base_color_texture"] is None:
+            kwargs["base_color_const"] = _prop_vec3(mf, f"{prefix}Basecolor")
+        channels.append(ChannelMaterial(**kwargs))
+    return channels
+
+
 class MaterialResolver:
     """Decodes .material files (by resolved path) and converts their diffuse
     / normal / opacity textures, with caching so a material referenced by
@@ -411,6 +534,8 @@ class MaterialResolver:
             # the material's constant paint colour instead of a flat grey.
             diffuse_color = _constant_diffuse_color(mf) or diffuse_color
 
+        channels = resolve_channels(mf, tex_by_name, self.textures) if is_uber_channel_material(mf) else []
+
         result = ResolvedMaterial(
             name=material_name,
             shader_name=mf.shader_name,
@@ -421,6 +546,7 @@ class MaterialResolver:
             diffuse_color=diffuse_color,
             diffuse_raw=diffuse_raw,
             normal_raw=normal_raw,
+            channels=channels,
         )
         self._cache[key] = result
         return result
